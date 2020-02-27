@@ -1,0 +1,18 @@
+[package]
+name = "bitcoin-p2p-firewall"
+version = "0.0.1"
+authors = ["Jude Nelson <judecn@gmail.com>"]
+license = "GPLv3"
+homepage = "https://github.com/jcnelson/bitcoin-p2p-firewall"
+repository = "https://github.com/jcnelson/bitcoin-p2p-firewall"
+description = "TCP proxy for filtering out Bitcoin p2p messages"
+keywords = [ "bitcoin", "crypto", "decentralized", "devops" ]
+readme = "README.md"
+
+[[bin]]
+name = "bitcoin-p2p-firewalld"
+path = "src/main.rs"
+
+[dependencies]
+mio = "0.6.16"
+
