@@ -51,4 +51,6 @@ $ ./bitcoin-p2p-firewalld -v 4 -n regtest -b block,cmpctblock 18444 127.0.0.1:18
 ```
 
 Here, the firewall will bind on port 18444, and will send filtered messages to
-127.0.0.1:18445.
+127.0.0.1:18445.  Blocks and compact blocks will be filtered from remote
+clients, thereby ensuring that the `bitcoind` node running on 127.0.0.1:18445
+will never see them
