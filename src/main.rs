@@ -204,6 +204,9 @@ impl error::Error for Error {
     }
 }
 
+/// Polling state from the network.
+/// Binds event IDs to newly-accepted sockets.
+/// Lists event IDs with I/O readiness.
 pub struct NetworkPollState {
     pub new: HashMap<usize, mio_net::TcpStream>,
     pub ready: Vec<usize>
@@ -218,6 +221,7 @@ impl NetworkPollState {
     }
 }
 
+/// State of the network.
 pub struct NetworkState {
     poll: mio::Poll,
     server: mio_net::TcpListener,
@@ -225,6 +229,8 @@ pub struct NetworkState {
     count: usize,
 }
 
+/// The "message type" field in a Bitcoin message header.  Always 12 bytes; contains a
+/// null-terminated ASCII string with the request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BitcoinCommand(pub [u8; 12]);
 
@@ -257,31 +263,55 @@ impl BitcoinCommand {
     }
 }
 
+/// Firewall forwarding state.
+/// Used both for relaying messages from downstream clients to the upstream bitcoind,
+/// and from the upstream bitcoind back down to a downstream client.
 pub struct ForwardState {
+    /// Buffer to store an incoming Bitcoin message header ("preamble")
     preamble_buf: Vec<u8>,
+    /// Buffer to store outgoing bytes to be sent
     write_buf: Vec<u8>,
+    /// Pointer into write_buf as to where to start writing again, in case of EWOULDBLOCK
     write_buf_ptr: usize,
+    /// Parsed Bitcoin message header.  Instantiated only if we're reading the payload.
     preamble: Option<BitcoinPreamble>,
+    /// Number of bytes consumed from the message payload.
     num_read: u64,
+    /// Whether or not the message will be dropped.
     filtered: bool,
+    /// Timestamp, in milliseconds since the Epoch, when we last read or wrote at least 1 byte
+    /// using this forwarding state.
     last_io_at: u128,
+    /// Forwarding state is associated with *two* sockets -- the downstream client socket, and the
+    /// upstream bitcoind socket.  This is the event ID of the _other_ socket this forwarding state
+    /// is bound to in the BitcoinProxy struct below.
     pair_event_id: usize,
 }
 
 pub struct BitcoinProxy {
+    /// What are the expected magic bytes in each Bitcoin message?
     magic: u32,
+    /// Network I/O state
     network: NetworkState,
+    /// Address of the upstream bitcoind node
     backend_addr: SocketAddr,
+    /// List of Bitcoin commands that are prohibited.  All else are allowed.  If this has items,
+    /// then whitelist will be empty.
     blacklist: Vec<BitcoinCommand>,
+    /// List of Bitcoin commands that are allowed.  All else are pohibited.  If this has items,
+    /// then blacklist will be empty.
     whitelist: Vec<BitcoinCommand>,
 
+    /// Map event IDs to their downstream sockets and their forwarding states.
     downstream: HashMap<usize, mio_net::TcpStream>,
     messages_downstream: HashMap<usize, ForwardState>,
     
+    /// Map event IDs to their upstream sockets and their forwarding states.
     upstream: HashMap<usize, mio_net::TcpStream>,
     messages_upstream: HashMap<usize, ForwardState>,
 }
 
+/// Bitcoin message header.  Note that it's fixed-sized.
 #[derive(Debug, PartialEq)]
 pub struct BitcoinPreamble {
     magic: u32,
@@ -303,6 +333,7 @@ impl BitcoinPreamble {
 }
 
 impl NetworkState {
+    /// Start listening on the given address.
     fn bind_address(addr: &SocketAddr) -> Result<mio_net::TcpListener, Error> {
         mio_net::TcpListener::bind(addr)
             .map_err(|e| {
@@ -311,12 +342,16 @@ impl NetworkState {
             })
     }
 
+    /// Allocate the next unused network ID.  Note that there is no roll-over logic (but on 64-bit
+    /// systems, usize is a 64-bit integer, so this really shouldn't be a problem).
     pub fn next_event_id(&mut self) -> usize {
         let cnt = self.count;
         self.count += 1;
         cnt
     }
 
+    /// Instantiate the network state.  Bind to the given address, and accept at most `capacity`
+    /// sockets.
     pub fn bind(addr: &SocketAddr, capacity: usize) -> Result<NetworkState, Error> {
         let server = NetworkState::bind_address(addr)?;
         let poll = mio::Poll::new()
@@ -341,7 +376,9 @@ impl NetworkState {
         })
     }
 
-    /// Register a socket for read/write notifications with this poller
+    /// Register a socket for read/write notifications with this poller.  Poll events will be keyed
+    /// to the given event ID.  Use edge triggers instead of level triggers, since that's the only
+    /// portable way to get events in mio.
     pub fn register(&mut self, event_id: usize, sock: &mio_net::TcpStream) -> Result<(), Error> {
         debug!("Register socket {:?} as event {}", sock, event_id);
         self.poll.register(sock, mio::Token(event_id), Ready::all(), PollOpt::edge())
@@ -351,7 +388,8 @@ impl NetworkState {
             })
     }
 
-    /// Deregister a socket event
+    /// Deregister a socket event.  Future events on the socket will be ignored, and the socket
+    /// will be explicitly shutdown.
     pub fn deregister(&mut self, sock: &mio_net::TcpStream) -> Result<(), Error> {
         self.poll.deregister(sock)
             .map_err(|e| {
@@ -366,7 +404,8 @@ impl NetworkState {
         Ok(())
     }
 
-    /// Poll socket states
+    /// Poll socket states.  Create a new NetworkPollState struct to store newly-accepted sockets,
+    /// and list ready sockets.
     pub fn poll(&mut self, timeout: u64) -> Result<NetworkPollState, Error> {
         self.poll.poll(&mut self.events, Some(Duration::from_millis(timeout)))
             .map_err(|e| {
@@ -424,6 +463,7 @@ impl ForwardState {
         }
     }
 
+    /// Reset the forwarding state.  Called each time we process a whole message.
     pub fn reset(&mut self) -> () {
         self.preamble_buf.clear();
         self.preamble = None;
@@ -433,6 +473,9 @@ impl ForwardState {
         self.write_buf_ptr = 0;
     }
 
+    /// Given the expected magic and byte buffer encoding a Bitcoin message header, parse it out.
+    /// Returns None if the bytes do not encode a well-formed header.
+    /// The checksum field will be ignored.
     fn parse_preamble(magic: u32, buf: &[u8]) -> Option<BitcoinPreamble> {
         if buf.len() < mem::size_of::<BitcoinPreamble>() {
             debug!("Invalid preamble: buf is {}, expected {}", buf.len(), mem::size_of::<BitcoinPreamble>());
@@ -471,10 +514,13 @@ impl ForwardState {
         })
     }
 
+    /// How many bytes are left to write out?
     pub fn buf_len(&self) -> usize {
         self.write_buf[self.write_buf_ptr..].len()
     }
 
+    /// Attempt to drain the write buffer to the given writeable upstream.  Returns Ok(true) if we
+    /// drain the buffer, Ok(false) if there are bytes remaining, or Err(...) on network error.
     pub fn try_flush<W: Write>(&mut self, upstream: &mut W) -> Result<bool, Error> {
         if self.filtered {
             debug!("Dropping {} bytes", self.write_buf.len() - self.write_buf_ptr);
@@ -514,9 +560,17 @@ impl ForwardState {
         }
     }
     
+    /// Read a Bitcoin message header from the readable fd, with the given magic bytes.
+    /// Reads up to, but not over, the number of bytes in a Bitcoin message header.
+    /// If we get enough bytes to form a Bitcoin message header, and if we successfully parse it
+    /// into a BitcoinPreamble, then return Ok(true) so we can proceed to read the payload.
+    /// Return Ok(false) if we don't have enough bytes to form a BitcoinPreamble.
+    /// Return Err(...) on network error, or if we can't parse a BitcoinPreamble (indicates to the
+    /// network poll loop to disconnect this socket).
     pub fn read_preamble<R: Read>(&mut self, magic: u32, fd: &mut R) -> Result<bool, Error> {
         assert!(self.preamble.is_none());
         if self.preamble_buf.len() >= mem::size_of::<BitcoinPreamble>() {
+            // should be unreachable
             return Err(Error::ConnectionBroken);
         }
 
@@ -562,6 +616,11 @@ impl ForwardState {
         }
     }
 
+    /// Consume a Bitcoin message payload from the given readable input.  
+    /// Buffers up the bytes into the write buffer, so a subsequent call to .try_flush() can be
+    /// used to send them to the paired socket.
+    /// Returns the number of bytes read on success.  Returns Err(...) on network error, in which case, the underlying
+    /// socket will be closed.
     pub fn read_payload<R: Read>(&mut self, input: &mut R) -> Result<usize, Error> {
         assert!(self.preamble.is_some());
 
@@ -585,7 +644,8 @@ impl ForwardState {
                     return Err(Error::ConnectionBroken);
                 }
                 else {
-                    // zero-length message
+                    // zero-length message was expected.
+                    // Can happen with `verack`, for example.
                     debug!("Read zero-length payload (so-far: {}, total: {})", self.num_read, preamble.length);
                     self.last_io_at = get_epoch_time_ms();
                     0
@@ -611,6 +671,7 @@ impl ForwardState {
         Ok(nr)
     }
 
+    /// Reset this forwarding state if we finished consuming a message.
     pub fn try_reset(&mut self) -> () {
         match self.preamble {
             Some(ref preamble) => {
@@ -623,6 +684,8 @@ impl ForwardState {
         }
     }
 
+    /// Has the socket gone more than IDLE_TIMEOUT milliseconds without reading or writing
+    /// anything?  Used to disconnect idle sockets.
     pub fn is_idle_timeout(&self) -> bool {
         if self.last_io_at + IDLE_TIMEOUT < get_epoch_time_ms() {
             return true;
@@ -634,6 +697,8 @@ impl ForwardState {
 }
 
 impl BitcoinProxy {
+    /// Create a new BitcoinProxy, bound to the given port, and forwarding packets to the given
+    /// backend socket address.  Binds a server socket on success.
     pub fn new(magic: u32, port: u16, backend_addr: SocketAddr) -> Result<BitcoinProxy, Error> {
         let net = NetworkState::bind(&format!("0.0.0.0:{}", port).parse::<SocketAddr>().unwrap(), 1000)?;
         Ok(BitcoinProxy {
@@ -649,14 +714,22 @@ impl BitcoinProxy {
         })
     }
 
+    /// Add a command to the firewall whitelist.
+    /// Duplicates are not checked.
     pub fn add_whitelist(&mut self, cmd: BitcoinCommand) -> () {
         self.whitelist.push(cmd);
     }
 
+    /// Adds a command to the firewall blacklist.
+    /// Duplicates are not checked.
     pub fn add_blacklist(&mut self, cmd: BitcoinCommand) -> () {
         self.blacklist.push(cmd);
     }
 
+    /// Given a preamble, a whitelist, and a blacklist, determine whether or not to filter the
+    /// Bitcoin message (returns true to filter; false not to).
+    /// While this is not checked, either whitelist, blacklist, or both must have zero entries for
+    /// this to work as expected.  If both lists are non-empty, the whitelist is preferred.
     pub fn filter(preamble: &BitcoinPreamble, whitelist: &Vec<BitcoinCommand>, blacklist: &Vec<BitcoinCommand>) -> bool {
         if whitelist.len() > 0 {
             for cmd in whitelist.iter() {
@@ -682,6 +755,13 @@ impl BitcoinProxy {
         return false;
     }
 
+    /// Register a downstream client connection.
+    /// This is called to handle a recently-accepted socket.
+    /// Opens an associated socket to the upstream bitcoind, so that messages from this socket are
+    /// sent out to bitcoind if they are not filtered.
+    /// Registers both sockets with the network poller, and creates forwarding state for both.
+    /// Each socket's forwarding state contains is the other's paired event ID, which will be
+    /// necessary to find the right socket to ferry bytes to when processing socket I/O.
     fn register_socket(&mut self, event_id: usize, socket: mio_net::TcpStream) -> Result<(), Error> {
         self.network.register(event_id, &socket)?;
         
@@ -708,6 +788,8 @@ impl BitcoinProxy {
         Ok(())
     }
 
+    /// Disconnect an event's socket from the poller, and free up its forwarding state.
+    /// Does not touch the event's paired socket.
     fn deregister_socket(&mut self, event_id: usize) -> () {
         if self.messages_downstream.get(&event_id).is_some() {
             match self.downstream.get(&event_id) {
@@ -734,12 +816,16 @@ impl BitcoinProxy {
         debug!("De-egistered event {}", event_id);
     }
 
+    /// Register all new downstream clients, and open an upstream socket to bitcoind for each one.
     pub fn process_new_sockets(&mut self, pollstate: &mut NetworkPollState) -> () {
         for (event_id, sock) in pollstate.new.drain() {
             let _ = self.register_socket(event_id, sock);
         }
     }
 
+    /// Handle socket I/O from one socket (inbound) to another (outbound), filtering messages as
+    /// needed.  Handles as many bytes as possible, bufferring them up into the inbound socket's
+    /// forwarding state as needed.  Runs until encountering EWOULDBLOCK.
     pub fn process_socket_io<R: Read, W: Write>(magic: u32, whitelist: &Vec<BitcoinCommand>, blacklist: &Vec<BitcoinCommand>, inbound: &mut R, forward: &mut ForwardState, outbound: &mut W) -> bool {
         let blocked;
         loop {
@@ -816,6 +902,9 @@ impl BitcoinProxy {
         return true;
     }
 
+    /// Handle I/O on all ready sockets.  Read bytes from downstream clients and write them to
+    /// their upstream sockets, and read bytes from upstream sockets and write them to downstream
+    /// clients.  The filter will only be applied to messages coming from downstream clients.
     pub fn process_ready_sockets(&mut self, pollstate: &mut NetworkPollState) -> () {
         let mut broken = vec![];
         for event_id in pollstate.ready.iter() {
@@ -870,6 +959,7 @@ impl BitcoinProxy {
         }
     }
 
+    /// Find idle sockets and disconnect them.
     pub fn process_dead_sockets(&mut self) -> () {
         let mut timedout : Vec<usize> = vec![];
         for event_id in self.messages_downstream.keys() {
@@ -899,6 +989,7 @@ impl BitcoinProxy {
         }
     }
 
+    /// Do one poll pass.
     pub fn poll(&mut self, timeout: u64) -> Result<(), Error> {
         let mut poll_state = self.network.poll(timeout)?;
         self.process_new_sockets(&mut poll_state);
@@ -908,6 +999,9 @@ impl BitcoinProxy {
     }
 }
 
+/// Given a mutable list of arguments, and a switch, find the first instance of the switch and its
+/// associated argument, remove them from argv, and return the argument itself.  Returns None if
+/// not found.
 fn find_arg_value(arg: &str, argv: &mut Vec<String>) -> Option<String> {
     debug!("Find '{}'. Argv is {:?}", arg, argv);
     let mut idx : i64 = -1;
@@ -930,11 +1024,13 @@ fn find_arg_value(arg: &str, argv: &mut Vec<String>) -> Option<String> {
     }
 }
 
+/// Print usage and exit
 fn usage(prog_name: String) -> () {
     eprintln!("Usage: {} [-w|-b MSG1,MSG2,MSG3,...] [-v VERBOSITY] [-n NETWORK-NAME] port upstream_addr", prog_name);
     process::exit(1);
 }
 
+// Entry point
 fn main() {
     set_loglevel(LOG_DEBUG).unwrap();
 
@@ -1026,6 +1122,8 @@ mod test {
     use std::io::Cursor;
     use std::io::{Read, Write};
 
+    /// A Cursor container that will return EWOULDBLOCK after reading a given number of bytes.
+    /// Used to test EWOULDBLOCK handling without actually setting up sockets.
     pub struct BlockingCursor<T> {
         inner: Cursor<T>,
         block_window: usize,
