@@ -17,16 +17,10 @@
  along with Blockstack. If not, see <http://www.gnu.org/licenses/>.
 */
 
-#![allow(unused_imports)]
-#![allow(dead_code)]
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-#![allow(non_upper_case_globals)]
 #![allow(unused_macros)]
 
 extern crate mio;
 
-use std::io::prelude::*;
 use std::io;
 use std::io::{Read, Write};
 use std::fmt;
@@ -46,17 +40,21 @@ use std::net::SocketAddr;
 use std::net::Shutdown;
 use std::time::Duration;
 use std::cell::RefCell;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const LOG_DEBUG : u8 = 4;
 pub const LOG_INFO : u8 = 3;
 pub const LOG_WARN : u8 = 2;
 pub const LOG_ERROR : u8 = 1;
 
+#[cfg(test)] pub const BUF_SIZE : usize = 16;
+#[cfg(not(test))] pub const BUF_SIZE : usize = 65536;
+
 // per-thread log level and log format
-thread_local!(static loglevel: RefCell<u8> = RefCell::new(LOG_DEBUG));
+thread_local!(static LOGLEVEL: RefCell<u8> = RefCell::new(LOG_DEBUG));
 
 pub fn set_loglevel(ll: u8) -> Result<(), String> {
-    loglevel.with(move |level| {
+    LOGLEVEL.with(move |level| {
         match ll {
             LOG_ERROR..=LOG_DEBUG => {
                 *level.borrow_mut() = ll;
@@ -71,11 +69,13 @@ pub fn set_loglevel(ll: u8) -> Result<(), String> {
 
 pub fn get_loglevel() -> u8 {
     let mut res = 0;
-    loglevel.with(|lvl| {
+    LOGLEVEL.with(|lvl| {
         res = *lvl.borrow();
     });
     res
 }
+
+pub const IDLE_TIMEOUT : u128 = 120000;       // 2 minutes idle without any I/O? kill the socket
 
 macro_rules! debug {
     ($($arg:tt)*) => ({
@@ -130,6 +130,13 @@ macro_rules! error {
 }
 
 const SERVER : Token = mio::Token(0);
+
+pub fn get_epoch_time_ms() -> u128 {
+    let start = SystemTime::now();
+    let since_the_epoch = start.duration_since(UNIX_EPOCH)
+        .expect("Time went backwards");
+    return since_the_epoch.as_millis();
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -212,7 +219,6 @@ impl NetworkPollState {
 }
 
 pub struct NetworkState {
-    addr: SocketAddr,
     poll: mio::Poll,
     server: mio_net::TcpListener,
     events: mio::Events,
@@ -253,8 +259,13 @@ impl BitcoinCommand {
 
 pub struct ForwardState {
     preamble_buf: Vec<u8>,
+    write_buf: Vec<u8>,
+    write_buf_ptr: usize,
     preamble: Option<BitcoinPreamble>,
-    num_read: u64
+    num_read: u64,
+    filtered: bool,
+    last_io_at: u128,
+    pair_event_id: usize,
 }
 
 pub struct BitcoinProxy {
@@ -264,16 +275,31 @@ pub struct BitcoinProxy {
     blacklist: Vec<BitcoinCommand>,
     whitelist: Vec<BitcoinCommand>,
 
-    messages: HashMap<usize, ForwardState>,
     downstream: HashMap<usize, mio_net::TcpStream>,
-    upstream: HashMap<usize, mio_net::TcpStream>
+    messages_downstream: HashMap<usize, ForwardState>,
+    
+    upstream: HashMap<usize, mio_net::TcpStream>,
+    messages_upstream: HashMap<usize, ForwardState>,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct BitcoinPreamble {
     magic: u32,
     command: BitcoinCommand,
     length: u32,
     checksum: u32
+}
+
+impl BitcoinPreamble {
+    #[cfg(test)]
+    pub fn new(magic: u32, command: &str, length: u32, checksum: u32) -> BitcoinPreamble {
+        BitcoinPreamble {
+            magic: magic,
+            command: BitcoinCommand::from_str(command).unwrap(),
+            length: length, 
+            checksum: checksum
+        }
+    }
 }
 
 impl NetworkState {
@@ -283,6 +309,12 @@ impl NetworkState {
                 error!("Failed to bind to {:?}: {:?}", addr, e);
                 Error::BindError
             })
+    }
+
+    pub fn next_event_id(&mut self) -> usize {
+        let cnt = self.count;
+        self.count += 1;
+        cnt
     }
 
     pub fn bind(addr: &SocketAddr, capacity: usize) -> Result<NetworkState, Error> {
@@ -295,26 +327,18 @@ impl NetworkState {
 
         let events = mio::Events::with_capacity(capacity);
 
-        poll.register(&server, SERVER, mio::Ready::readable(), mio::PollOpt::edge())
+        poll.register(&server, SERVER, mio::Ready::all(), mio::PollOpt::edge())
             .map_err(|e| {
                 error!("Failed to register server socket: {:?}", &e);
                 Error::BindError
             })?;
 
         Ok(NetworkState {
-            addr: addr.clone(),
             poll: poll,
             server: server,
             events: events,
             count: 1
         })
-    }
-
-    /// next event ID
-    pub fn next_event_id(&mut self) -> usize {
-        let ret = self.count;
-        self.count += 1;
-        ret
     }
 
     /// Register a socket for read/write notifications with this poller
@@ -390,8 +414,13 @@ impl ForwardState {
     pub fn new() -> ForwardState {
         ForwardState {
             preamble_buf: vec![],
+            write_buf: vec![],
+            write_buf_ptr: 0,
             preamble: None,
-            num_read: 0
+            num_read: 0,
+            filtered: false,
+            last_io_at: get_epoch_time_ms(),
+            pair_event_id: 0
         }
     }
 
@@ -399,18 +428,23 @@ impl ForwardState {
         self.preamble_buf.clear();
         self.preamble = None;
         self.num_read = 0;
+        self.filtered = false;
+        self.write_buf.clear();
+        self.write_buf_ptr = 0;
     }
 
     fn parse_preamble(magic: u32, buf: &[u8]) -> Option<BitcoinPreamble> {
-        if buf.len() != mem::size_of::<BitcoinPreamble>() {
+        if buf.len() < mem::size_of::<BitcoinPreamble>() {
+            debug!("Invalid preamble: buf is {}, expected {}", buf.len(), mem::size_of::<BitcoinPreamble>());
             return None;
         }
 
         let mut msg_magic_bytes = [0u8; 4];
         msg_magic_bytes.copy_from_slice(&buf[0..4]);
 
-        let msg_magic = u32::from_be_bytes(msg_magic_bytes);
+        let msg_magic = u32::from_le_bytes(msg_magic_bytes);
         if msg_magic != magic {
+            debug!("Invalid magic: expected {:x}, got {:x}", magic, msg_magic);
             return None;
         }
 
@@ -424,8 +458,10 @@ impl ForwardState {
         msg_len_bytes.copy_from_slice(&buf[16..20]);
         msg_checksum_bytes.copy_from_slice(&buf[20..24]);
 
-        let msglen = u32::from_be_bytes(msg_len_bytes);
-        let checksum = u32::from_be_bytes(msg_checksum_bytes);
+        let msglen = u32::from_le_bytes(msg_len_bytes);
+        let checksum = u32::from_le_bytes(msg_checksum_bytes);
+
+        debug!("Parsed preamble: '{}'. Payload length: {}", command.to_string(), msglen);
 
         Some(BitcoinPreamble {
             magic: magic,
@@ -433,6 +469,49 @@ impl ForwardState {
             length: msglen,
             checksum: checksum
         })
+    }
+
+    pub fn buf_len(&self) -> usize {
+        self.write_buf[self.write_buf_ptr..].len()
+    }
+
+    pub fn try_flush<W: Write>(&mut self, upstream: &mut W) -> Result<bool, Error> {
+        if self.filtered {
+            debug!("Dropping {} bytes", self.write_buf.len() - self.write_buf_ptr);
+            self.write_buf.clear();
+            self.write_buf_ptr = 0;
+            return Ok(true);
+        }
+
+        if self.write_buf_ptr >= self.write_buf.len() {
+            debug!("Write buffer is empty");
+            return Ok(true);
+        }
+
+        let to_flush = &self.write_buf[self.write_buf_ptr..];
+        let nw = upstream.write(to_flush)
+            .map_err(|e| {
+                match e.kind() {
+                    io::ErrorKind::WouldBlock => Error::Blocked,
+                    _ => Error::WriteError(e)
+                }
+            })?;
+
+        if nw > 0 {
+            self.last_io_at = get_epoch_time_ms();
+        }
+
+        debug!("Forwarded {} bytes upstream out of {}", nw, self.write_buf[self.write_buf_ptr..].len());
+        self.write_buf_ptr += nw;
+
+        if self.write_buf_ptr >= self.write_buf.len() {
+            self.write_buf.clear();
+            self.write_buf_ptr = 0;
+            return Ok(true);
+        }
+        else {
+            return Ok(false);
+        }
     }
     
     pub fn read_preamble<R: Read>(&mut self, magic: u32, fd: &mut R) -> Result<bool, Error> {
@@ -444,11 +523,16 @@ impl ForwardState {
         let to_read = mem::size_of::<BitcoinPreamble>() - self.preamble_buf.len();
         let mut buf = vec![0u8; to_read];
 
+        debug!("Read up to {} preamble bytes", to_read);
         let nr = match fd.read(&mut buf) {
             Ok(0) => {
                 return Err(Error::ConnectionBroken);
             },
-            Ok(nr) => nr,
+            Ok(nr) => {
+                debug!("Read {} preamble bytes out of {}", nr, to_read);
+                self.last_io_at = get_epoch_time_ms();
+                nr
+            },
             Err(e) => match e.kind() {
                 io::ErrorKind::WouldBlock => {
                     return Err(Error::Blocked);
@@ -466,6 +550,9 @@ impl ForwardState {
                 return Err(Error::ConnectionBroken);
             }
 
+            // forward premable upstream
+            self.write_buf.extend_from_slice(&self.preamble_buf);
+
             self.preamble = preamble;
             self.preamble_buf.clear();
             Ok(true)
@@ -475,24 +562,40 @@ impl ForwardState {
         }
     }
 
-    pub fn read_payload<R: Read, W: Write>(&mut self, input: &mut R, output: &mut W) -> Result<usize, Error> {
+    pub fn read_payload<R: Read>(&mut self, input: &mut R) -> Result<usize, Error> {
         assert!(self.preamble.is_some());
 
         let preamble = self.preamble.as_ref().unwrap();
-        assert!((preamble.length as u64) < self.num_read);
+        assert!(self.num_read <= (preamble.length as u64));
         
-        let to_read = self.num_read - (preamble.length as u64);
+        let to_read = (preamble.length as u64) - self.num_read;
         let max_read = 
-            if to_read > 65536 {
-                65536
+            if to_read > (BUF_SIZE + mem::size_of::<BitcoinPreamble>() - self.buf_len()) as u64 {
+                BUF_SIZE + mem::size_of::<BitcoinPreamble>() - self.buf_len()
             }
             else {
                 to_read as usize
             };
 
-        let mut buf = [0u8; 65536];
+        let mut buf = [0u8; BUF_SIZE + mem::size_of::<BitcoinPreamble>()];
         let nr = match input.read(&mut buf[0..max_read]) {
-            Ok(nr) => nr,
+            Ok(0) => {
+                if max_read > 0 {
+                    debug!("EOF encountered");
+                    return Err(Error::ConnectionBroken);
+                }
+                else {
+                    // zero-length message
+                    debug!("Read zero-length payload (so-far: {}, total: {})", self.num_read, preamble.length);
+                    self.last_io_at = get_epoch_time_ms();
+                    0
+                }
+            }
+            Ok(nr) => {
+                debug!("Read {} payload bytes out of {} (so-far: {}, total: {})", nr, max_read, self.num_read, preamble.length);
+                self.last_io_at = get_epoch_time_ms();
+                nr
+            },
             Err(e) => match e.kind() {
                 io::ErrorKind::WouldBlock => {
                     return Err(Error::Blocked);
@@ -503,20 +606,30 @@ impl ForwardState {
             }
         };
 
-        output.write_all(&buf[0..nr])
-            .map_err(|e| {
-                match e.kind() {
-                    io::ErrorKind::WouldBlock => Error::Blocked,
-                    _ => Error::WriteError(e)
-                }
-            })?;
-
+        self.write_buf.extend_from_slice(&buf[0..nr]);
         self.num_read += nr as u64;
-        if self.num_read >= preamble.length as u64 {
-            self.reset();
-        }
-
         Ok(nr)
+    }
+
+    pub fn try_reset(&mut self) -> () {
+        match self.preamble {
+            Some(ref preamble) => {
+                if self.num_read >= preamble.length as u64 && self.buf_len() == 0 {
+                    debug!("Reset!");
+                    self.reset();
+                }
+            },
+            None => {}
+        }
+    }
+
+    pub fn is_idle_timeout(&self) -> bool {
+        if self.last_io_at + IDLE_TIMEOUT < get_epoch_time_ms() {
+            return true;
+        }
+        else {
+            return false;
+        }
     }
 }
 
@@ -529,9 +642,10 @@ impl BitcoinProxy {
             backend_addr: backend_addr,
             blacklist: vec![],
             whitelist: vec![],
-            messages: HashMap::new(),
+            messages_downstream: HashMap::new(),
             downstream: HashMap::new(),
             upstream: HashMap::new(),
+            messages_upstream: HashMap::new(),
         })
     }
 
@@ -547,45 +661,75 @@ impl BitcoinProxy {
         if whitelist.len() > 0 {
             for cmd in whitelist.iter() {
                 if *cmd == preamble.command {
-                    return true;
+                    return false;
                 }
             }
             debug!("Filtered non-whitelisted command '{:?}'", preamble.command.to_string());
-            return false;
+            return true;
         }
 
         if blacklist.len() > 0 {
             for cmd in blacklist.iter() {
                 if *cmd == preamble.command {
                     debug!("Filtered blacklisted command '{:?}'", preamble.command.to_string());
-                    return false;
+                    return true;
                 }
             }
 
-            return true;
+            return false;
         }
 
         return false;
     }
 
     fn register_socket(&mut self, event_id: usize, socket: mio_net::TcpStream) -> Result<(), Error> {
-        let upstream_sync = net::TcpStream::connect_timeout(&self.backend_addr, Duration::new(2, 0)).map_err(|_e| Error::ConnectionError)?;
-        let upstream = mio_net::TcpStream::from_stream(upstream_sync).map_err(|_e| Error::ConnectionError)?;
-
-        let forward = ForwardState::new();
+        self.network.register(event_id, &socket)?;
         
-        self.messages.insert(event_id, forward);
-        self.downstream.insert(event_id, socket);
-        self.upstream.insert(event_id, upstream);
+        let upstream_sync = net::TcpStream::connect_timeout(&self.backend_addr, Duration::new(1, 0)).map_err(|_e| Error::ConnectionError)?;
+        let upstream = mio_net::TcpStream::from_stream(upstream_sync).map_err(|_e| Error::ConnectionError)?;
+        upstream.set_nodelay(true).map_err(|_e| Error::ConnectionError)?;
+        
+        let upstream_event_id = self.network.next_event_id();
+        self.network.register(upstream_event_id, &upstream)?;
 
-        debug!("Registered event {}", event_id);
+        let mut forward = ForwardState::new();
+        let mut backward = ForwardState::new();
+
+        forward.pair_event_id = upstream_event_id;
+        backward.pair_event_id = event_id;
+        
+        self.messages_downstream.insert(event_id, forward);
+        self.downstream.insert(event_id, socket);
+
+        self.messages_upstream.insert(upstream_event_id, backward);
+        self.upstream.insert(upstream_event_id, upstream);
+
+        debug!("Registered event pair {},{}", event_id, upstream_event_id);
         Ok(())
     }
 
     fn deregister_socket(&mut self, event_id: usize) -> () {
-        self.messages.remove(&event_id);
-        self.downstream.remove(&event_id);
-        self.upstream.remove(&event_id);
+        if self.messages_downstream.get(&event_id).is_some() {
+            match self.downstream.get(&event_id) {
+                Some(ref sock) => {
+                    let _ = self.network.deregister(sock);
+                },
+                None => {}
+            }
+
+            self.messages_downstream.remove(&event_id);
+        };
+        
+        if self.messages_upstream.get(&event_id).is_some() {
+            match self.upstream.get(&event_id) {
+                Some(ref sock) => {
+                    let _ = self.network.deregister(sock);
+                },
+                None => {}
+            }
+
+            self.messages_upstream.remove(&event_id);
+        };
 
         debug!("De-egistered event {}", event_id);
     }
@@ -596,7 +740,8 @@ impl BitcoinProxy {
         }
     }
 
-    pub fn process_socket_io(magic: u32, whitelist: &Vec<BitcoinCommand>, blacklist: &Vec<BitcoinCommand>, inbound: &mut mio_net::TcpStream, forward: &mut ForwardState, upstream: &mut mio_net::TcpStream) -> bool {
+    pub fn process_socket_io<R: Read, W: Write>(magic: u32, whitelist: &Vec<BitcoinCommand>, blacklist: &Vec<BitcoinCommand>, inbound: &mut R, forward: &mut ForwardState, outbound: &mut W) -> bool {
+        let blocked;
         loop {
             if forward.preamble.is_none() {
                 match forward.read_preamble(magic, inbound) {
@@ -605,7 +750,9 @@ impl BitcoinProxy {
                         return true;
                     },
                     Err(Error::Blocked) => {
-                        return true;
+                        debug!("read_preamble blocked");
+                        blocked = true;
+                        break;
                     },
                     Err(_e) => {
                         return false;
@@ -614,39 +761,106 @@ impl BitcoinProxy {
             }
 
             if forward.preamble.is_some() {
-                if BitcoinProxy::filter(&forward.preamble.as_ref().unwrap(), whitelist, blacklist) {
-                    return false;
+                if !forward.filtered && BitcoinProxy::filter(&forward.preamble.as_ref().unwrap(), whitelist, blacklist) {
+                    forward.filtered = true;
                 }
 
-                match forward.read_payload(inbound, upstream) {
-                    Ok(0) => {
-                        return false;
-                    },
+                match forward.read_payload(inbound) {
                     Ok(_) => {},
                     Err(Error::Blocked) => {
-                        return true;
+                        debug!("read_payload blocked");
+                        blocked = true;
+                        break;
                     }
                     Err(_e) => {
                         return false;
                     }
                 }
             }
+
+            match forward.try_flush(outbound) {
+                Ok(true) => {},
+                Ok(false) => {
+                    return true;
+                },
+                Err(Error::Blocked) => {
+                    debug!("try_flush blocked");
+                    blocked = true;
+                    break;
+                }
+                Err(_e) => {
+                    return false;
+                }
+            }
+
+            forward.try_reset();
         }
+        if blocked {
+            forward.try_reset();
+
+            // try to make space in the write buffer
+            match forward.try_flush(outbound) {
+                Ok(_) => {
+                    return true;
+                },
+                Err(Error::Blocked) => {
+                    debug!("try_flush blocked");
+                    return true;
+                },
+                Err(_e) => {
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
 
     pub fn process_ready_sockets(&mut self, pollstate: &mut NetworkPollState) -> () {
         let mut broken = vec![];
-
         for event_id in pollstate.ready.iter() {
-            match (self.messages.get_mut(event_id), self.downstream.get_mut(event_id), self.upstream.get_mut(event_id)) {
-                (Some(ref mut forward), Some(ref mut downstream), Some(ref mut upstream)) => {
-                    let alive = BitcoinProxy::process_socket_io(self.magic, &self.whitelist, &self.blacklist, downstream, forward, upstream);
-                    if !alive {
-                        broken.push(*event_id);
+            if self.downstream.get(event_id).is_some() {
+                debug!("Event {} (a downstream socket) is ready for I/O", event_id);
+                let pair_event_id = match self.messages_downstream.get(event_id) {
+                    Some(ref fwd) => fwd.pair_event_id,
+                    None => {
+                        continue;
+                    }
+                };
+
+                match (self.messages_downstream.get_mut(event_id), self.downstream.get_mut(event_id), self.upstream.get_mut(&pair_event_id)) {
+                    (Some(ref mut forward), Some(ref mut downstream), Some(ref mut upstream)) => {
+                        debug!("Process I/O from downstream event {} ({:?})", *event_id, downstream);
+                        let alive = BitcoinProxy::process_socket_io(self.magic, &self.whitelist, &self.blacklist, downstream, forward, upstream);
+                        if !alive {
+                            broken.push(*event_id);
+                        }
+                    }
+                    (_, _, _) => {
+                        continue;
                     }
                 }
-                (_, _, _) => {
-                    broken.push(*event_id);
+            }
+            else if self.upstream.get(event_id).is_some() {
+                debug!("Event {} (an upstream socket) is ready for I/O", event_id);
+                let pair_event_id = match self.messages_upstream.get(event_id) {
+                    Some(ref fwd) => fwd.pair_event_id,
+                    None => {
+                        continue;
+                    }
+                };
+
+                match (self.messages_upstream.get_mut(event_id), self.downstream.get_mut(&pair_event_id), self.upstream.get_mut(event_id)) {
+                    (Some(ref mut forward), Some(ref mut downstream), Some(ref mut upstream)) => {
+                        debug!("Process I/O from upstream event {} ({:?})", *event_id, downstream);
+                        let alive = BitcoinProxy::process_socket_io(self.magic, &vec![], &vec![], upstream, forward, downstream);
+                        if !alive {
+                            broken.push(*event_id);
+                        }
+                    }
+                    (_, _, _) => {
+                        continue;
+                    }
                 }
             }
         }
@@ -656,10 +870,40 @@ impl BitcoinProxy {
         }
     }
 
+    pub fn process_dead_sockets(&mut self) -> () {
+        let mut timedout : Vec<usize> = vec![];
+        for event_id in self.messages_downstream.keys() {
+            match self.messages_downstream.get(event_id) {
+                Some(ref fwd) => {
+                    if fwd.is_idle_timeout() {
+                        debug!("Event {} (downstream) has idled too long", event_id);
+                        timedout.push(*event_id);
+                    }
+                },
+                None => {}
+            }
+        }
+        for event_id in self.messages_upstream.keys() {
+            match self.messages_upstream.get(event_id) {
+                Some(ref fwd) => {
+                    if fwd.is_idle_timeout() {
+                        debug!("Event {} (upstream) has idled too long", event_id);
+                        timedout.push(*event_id);
+                    }
+                },
+                None => {}
+            }
+        }
+        for event_id in timedout {
+            self.deregister_socket(event_id);
+        }
+    }
+
     pub fn poll(&mut self, timeout: u64) -> Result<(), Error> {
         let mut poll_state = self.network.poll(timeout)?;
         self.process_new_sockets(&mut poll_state);
         self.process_ready_sockets(&mut poll_state);
+        self.process_dead_sockets();
         Ok(())
     }
 }
@@ -742,7 +986,10 @@ fn main() {
     let port = argv[1].parse::<u16>().map_err(|_e| usage(prog_name.clone())).unwrap();
     let backend = argv[2].parse::<SocketAddr>().map_err(|_e| usage(prog_name.clone())).unwrap();
 
+    debug!("Bind on port {}", port);
     let mut proxy = BitcoinProxy::new(magic, port, backend).unwrap();
+    debug!("Bound to 0.0.0.0:{}", port);
+
     for message_name in whitelist_filter.drain(..) {
         if message_name.len() > 12 {
             eprintln!("Invalid Bitcoin message type: '{}'", message_name);
@@ -773,3 +1020,339 @@ fn main() {
     }
 }
 
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::io::Cursor;
+    use std::io::{Read, Write};
+
+    pub struct BlockingCursor<T> {
+        inner: Cursor<T>,
+        block_window: usize,
+        block: bool,
+    }
+
+    impl<T: AsRef<[u8]>> BlockingCursor<T> {
+        pub fn new(cursor: Cursor<T>, block_window: usize) -> BlockingCursor<T> {
+            BlockingCursor {
+                inner: cursor,
+                block_window: block_window,
+                block: false,
+            }
+        }
+
+        pub fn destruct(self) -> Cursor<T> {
+            self.inner
+        }
+    }
+
+    impl<T: AsRef<[u8]>> Read for BlockingCursor<T> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if self.block {
+                self.block = false;
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            self.block = true;
+            if bytes.len() > self.block_window {
+                self.inner.read(&mut bytes[0..self.block_window])
+            }
+            else {
+                self.inner.read(bytes)
+            }
+        }
+    }
+
+    impl Write for BlockingCursor<&mut Vec<u8>> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.block {
+                self.block = false;
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            self.block = true;
+            if bytes.len() > self.block_window {
+                self.inner.write(&bytes[0..self.block_window])
+            }
+            else {
+                self.inner.write(bytes)
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn test_parse_preamble() {
+        let message_bytes = vec![
+            // magic
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (verack)
+            0x76, 0x65, 0x72, 0x61, 0x63, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (1234)
+            0x0d2, 0x04, 0x00, 0x00,
+            // checksum (0x12345678)
+            0x78, 0x56, 0x34, 0x12
+        ];
+        let preamble = ForwardState::parse_preamble(0xf9beb4d9, &message_bytes).unwrap();
+        assert_eq!(preamble, BitcoinPreamble::new(0xf9beb4d9, "verack", 1234, 0x12345678));
+
+        // bad magic
+        assert!(ForwardState::parse_preamble(0xD9B4BEF8, &message_bytes).is_none());
+    }
+
+    #[test]
+    fn test_read_message() {
+        let message_bytes = vec![
+            // magic
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (verack)
+            0x76, 0x65, 0x72, 0x61, 0x63, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (16)
+            0x10, 0x00, 0x00, 0x00,
+            // checksum (0x78563412)
+            0x12, 0x34, 0x56, 0x78,
+            // payload
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+        ];
+
+        let mut f = ForwardState::new();
+        let mut fd = io::Cursor::new(&message_bytes);
+        let mut output = vec![];
+
+        let res = f.read_preamble(0xf9beb4d9, &mut fd).unwrap();
+        assert!(res, "Failed to read preamble");
+
+        assert!(f.preamble.is_some());
+        assert_eq!(f.preamble, Some(BitcoinPreamble::new(0xf9beb4d9, "verack", 16, 0x78563412)));
+        assert_eq!(f.num_read, 0);
+
+        let res = f.try_flush(&mut output).unwrap();
+        assert!(res);
+
+        let res = f.read_payload(&mut fd).unwrap();
+        assert_eq!(res, 16);
+        
+        let res = f.try_flush(&mut output).unwrap();
+        assert!(res);
+
+        f.try_reset();
+        assert_eq!(output, message_bytes);
+        assert!(f.preamble.is_none());
+        assert_eq!(f.preamble_buf.len(), 0);
+        assert_eq!(f.num_read, 0);
+    }
+
+    #[test]
+    fn test_socket_io() {
+        let stream_bytes = vec![
+            // magic
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (version)
+            0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (8)
+            0x08, 0x00, 0x00, 0x00,
+            // checksum (0x12345678)
+            0x78, 0x56, 0x34, 0x12,
+            // payload
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+
+            // magic
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (verack)
+            0x76, 0x65, 0x72, 0x61, 0x63, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (16)
+            0x10, 0x00, 0x00, 0x00,
+            // checksum (0x22334455)
+            0x55, 0x44, 0x33, 0x22,
+            // payload
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+
+            // magic 
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (ping)
+            0x70, 0x69, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (4)
+            0x04, 0x00, 0x00, 0x00,
+            // checksum (0x33445566)
+            0x33, 0x44, 0x55, 0x66,
+            // payload
+            0x20, 0x21, 0x22, 0x23
+        ];
+
+        let mut f = ForwardState::new();
+        let inner_fd = io::Cursor::new(&stream_bytes);
+        let mut inner_output = vec![];
+
+        let mut fd = BlockingCursor::new(inner_fd, 10);
+        let mut output = BlockingCursor::new(io::Cursor::new(&mut inner_output), 10);
+
+        for _ in 0..stream_bytes.len() {
+            BitcoinProxy::process_socket_io(0xf9beb4d9, &vec![], &vec![], &mut fd, &mut f, &mut output);
+        }
+
+        let inner_fd = fd.destruct(); 
+        let inner_output = output.destruct();
+
+        assert_eq!(inner_fd.position(), stream_bytes.len() as u64);
+        assert_eq!(**inner_output.get_ref(), stream_bytes);
+    }
+    
+    #[test]
+    fn test_socket_io_whitelist() {
+        let stream_bytes = vec![
+            // magic
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (version)
+            0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (8)
+            0x08, 0x00, 0x00, 0x00,
+            // checksum (0x12345678)
+            0x78, 0x56, 0x34, 0x12,
+            // payload
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+
+            // magic
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (verack)
+            0x76, 0x65, 0x72, 0x61, 0x63, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (16)
+            0x10, 0x00, 0x00, 0x00,
+            // checksum (0x22334455)
+            0x55, 0x44, 0x33, 0x22,
+            // payload
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+
+            // magic 
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (ping)
+            0x70, 0x69, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (4)
+            0x04, 0x00, 0x00, 0x00,
+            // checksum (0x33445566)
+            0x66, 0x55, 0x44, 0x33,
+            // payload
+            0x20, 0x21, 0x22, 0x23
+        ];
+        
+        let filtered_stream_bytes = vec![
+            // magic
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (version)
+            0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (8)
+            0x08, 0x00, 0x00, 0x00,
+            // checksum (0x12345678)
+            0x78, 0x56, 0x34, 0x12,
+            // payload
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+
+            // magic 
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (ping)
+            0x70, 0x69, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (4)
+            0x04, 0x00, 0x00, 0x00,
+            // checksum (0x33445566)
+            0x66, 0x55, 0x44, 0x33,
+            // payload
+            0x20, 0x21, 0x22, 0x23
+        ];
+        
+        let mut f = ForwardState::new();
+        let inner_fd = io::Cursor::new(&stream_bytes);
+        let mut inner_output = vec![];
+
+        let mut fd = BlockingCursor::new(inner_fd, 10);
+        let mut output = BlockingCursor::new(io::Cursor::new(&mut inner_output), 10);
+
+        for _ in 0..stream_bytes.len() {
+            BitcoinProxy::process_socket_io(0xf9beb4d9, &vec![BitcoinCommand::from_str("version").unwrap(), BitcoinCommand::from_str("ping").unwrap()], &vec![], &mut fd, &mut f, &mut output);
+        }
+
+        let inner_fd = fd.destruct(); 
+        let inner_output = output.destruct();
+
+        assert_eq!(inner_fd.position(), stream_bytes.len() as u64);
+        assert_eq!(**inner_output.get_ref(), filtered_stream_bytes);
+    }
+    
+    #[test]
+    fn test_socket_io_blacklist() {
+        let stream_bytes = vec![
+            // magic
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (version)
+            0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (8)
+            0x08, 0x00, 0x00, 0x00,
+            // checksum (0x12345678)
+            0x78, 0x56, 0x34, 0x12,
+            // payload
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+
+            // magic
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (verack)
+            0x76, 0x65, 0x72, 0x61, 0x63, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (16)
+            0x10, 0x00, 0x00, 0x00,
+            // checksum (0x22334455)
+            0x55, 0x44, 0x33, 0x22,
+            // payload
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+
+            // magic 
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (ping)
+            0x70, 0x69, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (4)
+            0x04, 0x00, 0x00, 0x00,
+            // checksum (0x33445566)
+            0x66, 0x55, 0x44, 0x33,
+            // payload
+            0x20, 0x21, 0x22, 0x23
+        ];
+        
+        let filtered_stream_bytes = vec![
+            // magic
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (version)
+            0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (8)
+            0x08, 0x00, 0x00, 0x00,
+            // checksum (0x12345678)
+            0x78, 0x56, 0x34, 0x12,
+            // payload
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+
+            // magic 
+            0xd9, 0xb4, 0xbe, 0xf9,
+            // command (ping)
+            0x70, 0x69, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // length (4)
+            0x04, 0x00, 0x00, 0x00,
+            // checksum (0x33445566)
+            0x66, 0x55, 0x44, 0x33,
+            // payload
+            0x20, 0x21, 0x22, 0x23
+        ];
+
+        let mut f = ForwardState::new();
+        let inner_fd = io::Cursor::new(&stream_bytes);
+        let mut inner_output = vec![];
+
+        let mut fd = BlockingCursor::new(inner_fd, 10);
+        let mut output = BlockingCursor::new(io::Cursor::new(&mut inner_output), 10);
+
+        for _ in 0..stream_bytes.len() {
+            BitcoinProxy::process_socket_io(0xf9beb4d9, &vec![], &vec![BitcoinCommand::from_str("verack").unwrap()], &mut fd, &mut f, &mut output);
+        }
+
+        let inner_fd = fd.destruct(); 
+        let inner_output = output.destruct();
+
+        assert_eq!(inner_fd.position(), stream_bytes.len() as u64);
+        assert_eq!(**inner_output.get_ref(), filtered_stream_bytes);
+    }
+}
