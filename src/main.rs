@@ -37,6 +37,7 @@ use std::env;
 use std::collections::HashMap;
 use std::net;
 use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 use std::net::Shutdown;
 use std::time::Duration;
 use std::cell::RefCell;
@@ -1080,11 +1081,28 @@ fn main() {
         usage(prog_name.clone());
     }
     let port = argv[1].parse::<u16>().map_err(|_e| usage(prog_name.clone())).unwrap();
-    let backend = argv[2].parse::<SocketAddr>().map_err(|_e| usage(prog_name.clone())).unwrap();
+    let backend_str = &argv[2];
+    let backend = match backend_str.parse::<SocketAddr>() {
+        Ok(backend) => backend,
+        Err(_e) => match backend_str.as_str().to_socket_addrs() {
+            Ok(mut addrs) => match addrs.next() {
+                Some(addr) => addr,
+                None => {
+                    usage(prog_name.clone());
+                    unreachable!();
+                }
+            },
+            Err(_e) => {
+                usage(prog_name.clone());
+                unreachable!();
+            }
+        }
+    };
 
     debug!("Bind on port {}", port);
     let mut proxy = BitcoinProxy::new(magic, port, backend).unwrap();
     debug!("Bound to 0.0.0.0:{}", port);
+    debug!("Backend is {}", &backend);
 
     for message_name in whitelist_filter.drain(..) {
         if message_name.len() > 12 {
