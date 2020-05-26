@@ -50,7 +50,7 @@ pub const LOG_WARN : u8 = 2;
 pub const LOG_ERROR : u8 = 1;
 
 #[cfg(test)] pub const BUF_SIZE : usize = 4;
-#[cfg(not(test))] pub const BUF_SIZE : usize = 4;
+#[cfg(not(test))] pub const BUF_SIZE : usize = 65536;
 
 pub const MAX_MSG_BUF_LEN : usize = 128;
 
