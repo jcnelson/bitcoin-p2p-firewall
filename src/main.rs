@@ -35,6 +35,7 @@ use mio::PollOpt;
 use std::process;
 use std::env;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
@@ -48,8 +49,10 @@ pub const LOG_INFO : u8 = 3;
 pub const LOG_WARN : u8 = 2;
 pub const LOG_ERROR : u8 = 1;
 
-#[cfg(test)] pub const BUF_SIZE : usize = 16;
-#[cfg(not(test))] pub const BUF_SIZE : usize = 65536;
+#[cfg(test)] pub const BUF_SIZE : usize = 4;
+#[cfg(not(test))] pub const BUF_SIZE : usize = 4;
+
+pub const MAX_MSG_BUF_LEN : usize = 128;
 
 // per-thread log level and log format
 thread_local!(static LOGLEVEL: RefCell<u8> = RefCell::new(LOG_DEBUG));
@@ -76,7 +79,7 @@ pub fn get_loglevel() -> u8 {
     res
 }
 
-pub const IDLE_TIMEOUT : u128 = 120000;       // 2 minutes idle without any I/O? kill the socket
+pub const IDLE_TIMEOUT : u128 = 30 * 1000;       // 30 minutes idle without any I/O? kill the socket
 
 macro_rules! debug {
     ($($arg:tt)*) => ({
@@ -165,6 +168,8 @@ pub enum Error {
     SocketError,
     /// server is not bound to a socket
     NotConnected,
+    /// Stream is sending too fast
+    BurstError,
 }
 
 impl fmt::Display for Error {
@@ -182,6 +187,7 @@ impl fmt::Display for Error {
             Error::SocketError => write!(f, "Socket error"),
             Error::NotConnected => write!(f, "Not connected to peer network"),
             Error::Blocked => write!(f, "EWOULDBLOCK"),
+            Error::BurstError => write!(f, "Stream is sending too much data"),
         }
     }
 }
@@ -201,6 +207,7 @@ impl error::Error for Error {
             Error::SocketError => None,
             Error::NotConnected => None,
             Error::Blocked => None,
+            Error::BurstError => None,
         }
     }
 }
@@ -270,10 +277,12 @@ impl BitcoinCommand {
 pub struct ForwardState {
     /// Buffer to store an incoming Bitcoin message header ("preamble")
     preamble_buf: Vec<u8>,
-    /// Buffer to store outgoing bytes to be sent
-    write_buf: Vec<u8>,
-    /// Pointer into write_buf as to where to start writing again, in case of EWOULDBLOCK
-    write_buf_ptr: usize,
+    /// Buffer to store outgoing bytes to be sent (preamble and payload)
+    recv_buf: Vec<u8>,
+    /// List of messages received that need to be sent upstream
+    messages_to_send: VecDeque<Vec<u8>>,
+    /// Pointer into the head of the messages_to_send list
+    send_ptr: usize,
     /// Parsed Bitcoin message header.  Instantiated only if we're reading the payload.
     preamble: Option<BitcoinPreamble>,
     /// Number of bytes consumed from the message payload.
@@ -454,8 +463,9 @@ impl ForwardState {
     pub fn new() -> ForwardState {
         ForwardState {
             preamble_buf: vec![],
-            write_buf: vec![],
-            write_buf_ptr: 0,
+            recv_buf: vec![],
+            send_ptr: 0,
+            messages_to_send: VecDeque::new(),
             preamble: None,
             num_read: 0,
             filtered: false,
@@ -465,13 +475,31 @@ impl ForwardState {
     }
 
     /// Reset the forwarding state.  Called each time we process a whole message.
-    pub fn reset(&mut self) -> () {
+    pub fn reset_write(&mut self) -> () {
+        debug!("Reset write!");
+        self.messages_to_send.pop_front();
+        self.send_ptr = 0;
+    }
+    
+    pub fn reset_read(&mut self) -> Result<(), Error> {
+        debug!("Reset read! Filtered = {}", self.filtered);
+        if !self.filtered {
+            if self.messages_to_send.len() > MAX_MSG_BUF_LEN {
+                error!("Too many messages from event {}", self.pair_event_id);
+                return Err(Error::BurstError);
+            }
+
+            let buf = mem::replace(&mut self.recv_buf, vec![]);
+            self.messages_to_send.push_back(buf);
+        }
+        else {
+            self.recv_buf.clear();
+        }
         self.preamble_buf.clear();
         self.preamble = None;
         self.num_read = 0;
         self.filtered = false;
-        self.write_buf.clear();
-        self.write_buf_ptr = 0;
+        Ok(())
     }
 
     /// Given the expected magic and byte buffer encoding a Bitcoin message header, parse it out.
@@ -515,27 +543,30 @@ impl ForwardState {
         })
     }
 
-    /// How many bytes are left to write out?
-    pub fn buf_len(&self) -> usize {
-        self.write_buf[self.write_buf_ptr..].len()
-    }
-
     /// Attempt to drain the write buffer to the given writeable upstream.  Returns Ok(true) if we
     /// drain the buffer, Ok(false) if there are bytes remaining, or Err(...) on network error.
     pub fn try_flush<W: Write>(&mut self, upstream: &mut W) -> Result<bool, Error> {
-        if self.filtered {
-            debug!("Dropping {} bytes", self.write_buf.len() - self.write_buf_ptr);
-            self.write_buf.clear();
-            self.write_buf_ptr = 0;
+        if self.messages_to_send.len() == 0 {
             return Ok(true);
         }
 
-        if self.write_buf_ptr >= self.write_buf.len() {
-            debug!("Write buffer is empty");
-            return Ok(true);
+        let write_buf = self.messages_to_send.front().unwrap();
+        if self.send_ptr >= write_buf.len() {
+            debug!("Write buffer is empty: {} >= {}", self.send_ptr, write_buf.len());
+            self.reset_write();
+            return Ok(self.messages_to_send.len() == 0);
         }
 
-        let to_flush = &self.write_buf[self.write_buf_ptr..];
+        let max_write = 
+            if self.send_ptr + BUF_SIZE < write_buf.len() {
+                BUF_SIZE
+            }
+            else {
+                write_buf.len() - self.send_ptr
+            };
+
+        debug!("Try to write up to {} bytes", &max_write);
+        let to_flush = &write_buf[self.send_ptr..(self.send_ptr + max_write)];
         let nw = upstream.write(to_flush)
             .map_err(|e| {
                 match e.kind() {
@@ -548,13 +579,13 @@ impl ForwardState {
             self.last_io_at = get_epoch_time_ms();
         }
 
-        debug!("Forwarded {} bytes upstream out of {}", nw, self.write_buf[self.write_buf_ptr..].len());
-        self.write_buf_ptr += nw;
+        debug!("Forwarded {} bytes upstream, ptr={}, len={}", nw, self.send_ptr, write_buf.len());
+        self.send_ptr += nw;
 
-        if self.write_buf_ptr >= self.write_buf.len() {
-            self.write_buf.clear();
-            self.write_buf_ptr = 0;
-            return Ok(true);
+        if self.send_ptr >= write_buf.len() {
+            debug!("Clear flushed write buffer ({} bytes)", write_buf.len());
+            self.reset_write();
+            return Ok(self.messages_to_send.len() == 0);
         }
         else {
             return Ok(false);
@@ -590,6 +621,7 @@ impl ForwardState {
             },
             Err(e) => match e.kind() {
                 io::ErrorKind::WouldBlock => {
+                    debug!("Reader is blocked");
                     return Err(Error::Blocked);
                 }
                 _ => {
@@ -606,13 +638,14 @@ impl ForwardState {
             }
 
             // forward premable upstream
-            self.write_buf.extend_from_slice(&self.preamble_buf);
+            self.recv_buf.extend_from_slice(&self.preamble_buf);
 
             self.preamble = preamble;
             self.preamble_buf.clear();
             Ok(true)
         }
         else {
+            debug!("Reader has read {} preamble bytes ({} total)", nr, self.preamble_buf.len());
             Ok(false)
         }
     }
@@ -629,15 +662,17 @@ impl ForwardState {
         assert!(self.num_read <= (preamble.length as u64));
         
         let to_read = (preamble.length as u64) - self.num_read;
-        let max_read = 
-            if to_read > (BUF_SIZE + mem::size_of::<BitcoinPreamble>() - self.buf_len()) as u64 {
-                BUF_SIZE + mem::size_of::<BitcoinPreamble>() - self.buf_len()
+        let max_read =
+            if to_read < BUF_SIZE as u64 {
+                to_read as usize
             }
             else {
-                to_read as usize
+                BUF_SIZE as usize
             };
 
-        let mut buf = [0u8; BUF_SIZE + mem::size_of::<BitcoinPreamble>()];
+        debug!("Read up to {} bytes", &max_read);
+
+        let mut buf = [0u8; BUF_SIZE];
         let nr = match input.read(&mut buf[0..max_read]) {
             Ok(0) => {
                 if max_read > 0 {
@@ -647,7 +682,7 @@ impl ForwardState {
                 else {
                     // zero-length message was expected.
                     // Can happen with `verack`, for example.
-                    debug!("Read zero-length payload (so-far: {}, total: {})", self.num_read, preamble.length);
+                    debug!("Read zero-length payload (so-far: {}, total: {}, max: {})", self.num_read, preamble.length, max_read);
                     self.last_io_at = get_epoch_time_ms();
                     0
                 }
@@ -667,22 +702,75 @@ impl ForwardState {
             }
         };
 
-        self.write_buf.extend_from_slice(&buf[0..nr]);
+        self.recv_buf.extend_from_slice(&buf[0..nr]);
         self.num_read += nr as u64;
+
+        if self.num_read >= (preamble.length as u64) {
+            self.reset_read()?;
+        }
+        
         Ok(nr)
     }
 
-    /// Reset this forwarding state if we finished consuming a message.
-    pub fn try_reset(&mut self) -> () {
-        match self.preamble {
-            Some(ref preamble) => {
-                if self.num_read >= preamble.length as u64 && self.buf_len() == 0 {
-                    debug!("Reset!");
-                    self.reset();
+    /// Read preambles and messages until blocked
+    pub fn read_until_blocked<R: Read>(&mut self, magic: u32, input: &mut R, whitelist: &Vec<BitcoinCommand>, blacklist: &Vec<BitcoinCommand>) -> bool {
+        let mut blocked = false;
+        while !blocked {
+            if self.preamble.is_none() {
+                match self.read_preamble(magic, input) {
+                    Ok(_) => {},
+                    Err(Error::Blocked) => {
+                        debug!("read_preamble blocked");
+                        blocked = true;
+                    },
+                    Err(_e) => {
+                        return false;
+                    }
                 }
-            },
-            None => {}
+            }
+
+            if self.preamble.is_some() {
+                if !self.filtered && BitcoinProxy::filter(&self.preamble.as_ref().unwrap(), whitelist, blacklist) {
+                    self.filtered = true;
+                }
+
+                match self.read_payload(input) {
+                    Ok(_) => {},
+                    Err(Error::Blocked) => {
+                        debug!("read_payload blocked");
+                        blocked = true;
+                    }
+                    Err(_e) => {
+                        return false;
+                    }
+                }
+            }
         }
+
+        return true;
+    }
+
+    /// Send out messages until blocked
+    pub fn write_until_blocked<W: Write>(&mut self, output: &mut W) -> bool {
+        let mut blocked = false;
+        while !blocked {
+            match self.try_flush(output) {
+                Ok(drained) => {
+                    if drained {
+                        // nothing more to send
+                        blocked = true;
+                    }
+                },
+                Err(Error::Blocked) => {
+                    debug!("try_flush blocked");
+                    blocked = true;
+                }
+                Err(_e) => {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /// Has the socket gone more than IDLE_TIMEOUT milliseconds without reading or writing
@@ -764,11 +852,18 @@ impl BitcoinProxy {
     /// Each socket's forwarding state contains is the other's paired event ID, which will be
     /// necessary to find the right socket to ferry bytes to when processing socket I/O.
     fn register_socket(&mut self, event_id: usize, socket: mio_net::TcpStream) -> Result<(), Error> {
+        socket.set_nodelay(true).map_err(|_e| Error::ConnectionError)?;
+        socket.set_send_buffer_size(BUF_SIZE).unwrap();
+        socket.set_recv_buffer_size(BUF_SIZE).unwrap();
+
         self.network.register(event_id, &socket)?;
         
         let upstream_sync = net::TcpStream::connect_timeout(&self.backend_addr, Duration::new(1, 0)).map_err(|_e| Error::ConnectionError)?;
         let upstream = mio_net::TcpStream::from_stream(upstream_sync).map_err(|_e| Error::ConnectionError)?;
+        
         upstream.set_nodelay(true).map_err(|_e| Error::ConnectionError)?;
+        upstream.set_send_buffer_size(BUF_SIZE).unwrap();
+        upstream.set_recv_buffer_size(BUF_SIZE).unwrap();
         
         let upstream_event_id = self.network.next_event_id();
         self.network.register(upstream_event_id, &upstream)?;
@@ -793,24 +888,18 @@ impl BitcoinProxy {
     /// Does not touch the event's paired socket.
     fn deregister_socket(&mut self, event_id: usize) -> () {
         if self.messages_downstream.get(&event_id).is_some() {
-            match self.downstream.get(&event_id) {
-                Some(ref sock) => {
-                    let _ = self.network.deregister(sock);
-                },
-                None => {}
+            if let Some(sock) = self.downstream.get(&event_id) {
+                let _ = self.network.deregister(sock);
             }
-
+            self.downstream.remove(&event_id);
             self.messages_downstream.remove(&event_id);
         };
         
         if self.messages_upstream.get(&event_id).is_some() {
-            match self.upstream.get(&event_id) {
-                Some(ref sock) => {
-                    let _ = self.network.deregister(sock);
-                },
-                None => {}
+            if let Some(sock) = self.upstream.get(&event_id) {
+                let _ = self.network.deregister(sock);
             }
-
+            self.upstream.remove(&event_id);
             self.messages_upstream.remove(&event_id);
         };
 
@@ -826,80 +915,15 @@ impl BitcoinProxy {
 
     /// Handle socket I/O from one socket (inbound) to another (outbound), filtering messages as
     /// needed.  Handles as many bytes as possible, bufferring them up into the inbound socket's
-    /// forwarding state as needed.  Runs until encountering EWOULDBLOCK.
+    /// forwarding state as needed.  Runs until encountering EWOULDBLOCK on both inbound and
+    /// outbound.
     pub fn process_socket_io<R: Read, W: Write>(magic: u32, whitelist: &Vec<BitcoinCommand>, blacklist: &Vec<BitcoinCommand>, inbound: &mut R, forward: &mut ForwardState, outbound: &mut W) -> bool {
-        let blocked;
-        loop {
-            if forward.preamble.is_none() {
-                match forward.read_preamble(magic, inbound) {
-                    Ok(true) => {},
-                    Ok(false) => {
-                        return true;
-                    },
-                    Err(Error::Blocked) => {
-                        debug!("read_preamble blocked");
-                        blocked = true;
-                        break;
-                    },
-                    Err(_e) => {
-                        return false;
-                    }
-                }
-            }
-
-            if forward.preamble.is_some() {
-                if !forward.filtered && BitcoinProxy::filter(&forward.preamble.as_ref().unwrap(), whitelist, blacklist) {
-                    forward.filtered = true;
-                }
-
-                match forward.read_payload(inbound) {
-                    Ok(_) => {},
-                    Err(Error::Blocked) => {
-                        debug!("read_payload blocked");
-                        blocked = true;
-                        break;
-                    }
-                    Err(_e) => {
-                        return false;
-                    }
-                }
-            }
-
-            match forward.try_flush(outbound) {
-                Ok(true) => {},
-                Ok(false) => {
-                    return true;
-                },
-                Err(Error::Blocked) => {
-                    debug!("try_flush blocked");
-                    blocked = true;
-                    break;
-                }
-                Err(_e) => {
-                    return false;
-                }
-            }
-
-            forward.try_reset();
+        if !forward.read_until_blocked(magic, inbound, whitelist, blacklist) {
+            return false;
         }
-        if blocked {
-            forward.try_reset();
-
-            // try to make space in the write buffer
-            match forward.try_flush(outbound) {
-                Ok(_) => {
-                    return true;
-                },
-                Err(Error::Blocked) => {
-                    debug!("try_flush blocked");
-                    return true;
-                },
-                Err(_e) => {
-                    return false;
-                }
-            }
+        if !forward.write_until_blocked(outbound) {
+            return false;
         }
-
         return true;
     }
 
@@ -992,7 +1016,10 @@ impl BitcoinProxy {
 
     /// Do one poll pass.
     pub fn poll(&mut self, timeout: u64) -> Result<(), Error> {
+        debug!("<<<<<<<<<<<<<<<<< Begin poll ({}) <<<<<<<<<<<<<<<<<<<<<<<", timeout);
         let mut poll_state = self.network.poll(timeout)?;
+        debug!("<<<<<<<<<<<<<<<<<<< End poll <<<<<<<<<<<<<<<<<<<<<<<");
+
         self.process_new_sockets(&mut poll_state);
         self.process_ready_sockets(&mut poll_state);
         self.process_dead_sockets();
@@ -1125,7 +1152,7 @@ fn main() {
     }
 
     loop {
-        match proxy.poll(100) {
+        match proxy.poll(IDLE_TIMEOUT as u64) {
             Ok(_) => {},
             Err(_e) => {
                 break;
@@ -1246,13 +1273,31 @@ mod test {
         let res = f.try_flush(&mut output).unwrap();
         assert!(res);
 
-        let res = f.read_payload(&mut fd).unwrap();
-        assert_eq!(res, 16);
-        
-        let res = f.try_flush(&mut output).unwrap();
-        assert!(res);
+        let mut total = 0;
+        loop {
+            match f.read_payload(&mut fd) {
+                Ok(sz) => {
+                    total += sz;
+                    if total >= 16 {
+                        break;
+                    }
+                }
+                Err(Error::Blocked) => {
+                    break;
+                },
+                Err(e) => {
+                    panic!("{:?}", &e);
+                }
+            }
+        }
+       
+        loop {
+            let res = f.try_flush(&mut output).unwrap();
+            if res {
+                break;
+            }
+        }
 
-        f.try_reset();
         assert_eq!(output, message_bytes);
         assert!(f.preamble.is_none());
         assert_eq!(f.preamble_buf.len(), 0);
