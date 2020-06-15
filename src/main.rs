@@ -26,6 +26,7 @@ use std::io::{Read, Write};
 use std::fmt;
 use std::error;
 use std::mem;
+use std::time;
 
 use mio::net as mio_net;
 use mio::Ready;
@@ -79,7 +80,7 @@ pub fn get_loglevel() -> u8 {
     res
 }
 
-pub const IDLE_TIMEOUT : u128 = 30 * 1000;       // 30 minutes idle without any I/O? kill the socket
+pub const IDLE_TIMEOUT : u128 = 30 * 1000;       // 30 seconds idle without any I/O? kill the socket
 
 macro_rules! debug {
     ($($arg:tt)*) => ({
@@ -798,8 +799,8 @@ impl BitcoinProxy {
             whitelist: vec![],
             messages_downstream: HashMap::new(),
             downstream: HashMap::new(),
-            upstream: HashMap::new(),
             messages_upstream: HashMap::new(),
+            upstream: HashMap::new(),
         })
     }
 
@@ -853,20 +854,26 @@ impl BitcoinProxy {
     /// necessary to find the right socket to ferry bytes to when processing socket I/O.
     fn register_socket(&mut self, event_id: usize, socket: mio_net::TcpStream) -> Result<(), Error> {
         socket.set_nodelay(true).map_err(|_e| Error::ConnectionError)?;
-        socket.set_send_buffer_size(BUF_SIZE).unwrap();
-        socket.set_recv_buffer_size(BUF_SIZE).unwrap();
-
-        self.network.register(event_id, &socket)?;
-        
+        socket.set_send_buffer_size(BUF_SIZE).map_err(|_e| Error::ConnectionError)?;
+        socket.set_recv_buffer_size(BUF_SIZE).map_err(|_e| Error::ConnectionError)?;
+        socket.set_linger(Some(time::Duration::from_millis(5000))).map_err(|_e| Error::ConnectionError)?;
+ 
         let upstream_sync = net::TcpStream::connect_timeout(&self.backend_addr, Duration::new(1, 0)).map_err(|_e| Error::ConnectionError)?;
         let upstream = mio_net::TcpStream::from_stream(upstream_sync).map_err(|_e| Error::ConnectionError)?;
         
         upstream.set_nodelay(true).map_err(|_e| Error::ConnectionError)?;
-        upstream.set_send_buffer_size(BUF_SIZE).unwrap();
-        upstream.set_recv_buffer_size(BUF_SIZE).unwrap();
+        upstream.set_send_buffer_size(BUF_SIZE).map_err(|_e| Error::ConnectionError)?;
+        upstream.set_recv_buffer_size(BUF_SIZE).map_err(|_e| Error::ConnectionError)?;
+        upstream.set_linger(Some(time::Duration::from_millis(5000))).map_err(|_e| Error::ConnectionError)?;
         
         let upstream_event_id = self.network.next_event_id();
-        self.network.register(upstream_event_id, &upstream)?;
+
+        self.network.register(event_id, &socket)?;
+        self.network.register(upstream_event_id, &upstream)
+            .map_err(|e| {
+                let _ = self.network.deregister(&socket);
+                e
+            })?;
 
         let mut forward = ForwardState::new();
         let mut backward = ForwardState::new();
@@ -885,23 +892,41 @@ impl BitcoinProxy {
     }
 
     /// Disconnect an event's socket from the poller, and free up its forwarding state.
-    /// Does not touch the event's paired socket.
+    /// Also closes the paired socket.
     fn deregister_socket(&mut self, event_id: usize) -> () {
-        if self.messages_downstream.get(&event_id).is_some() {
+        if let Some(fwd) = self.messages_downstream.remove(&event_id) {
             if let Some(sock) = self.downstream.get(&event_id) {
                 let _ = self.network.deregister(sock);
             }
+
+            let mut remove_upstream = false;
+            if let Some(sock) = self.upstream.get(&fwd.pair_event_id) {
+                let _ = self.network.deregister(sock);
+                remove_upstream = true;
+            }
+
             self.downstream.remove(&event_id);
-            self.messages_downstream.remove(&event_id);
-        };
-        
-        if self.messages_upstream.get(&event_id).is_some() {
+            if remove_upstream {
+                self.upstream.remove(&fwd.pair_event_id);
+            }
+        }
+       
+        if let Some(fwd) = self.messages_upstream.remove(&event_id) {
             if let Some(sock) = self.upstream.get(&event_id) {
                 let _ = self.network.deregister(sock);
             }
+
+            let mut remove_downstream = false;
+            if let Some(sock) = self.downstream.get(&fwd.pair_event_id) {
+                let _ = self.network.deregister(sock);
+                remove_downstream = true;
+            }
+
             self.upstream.remove(&event_id);
-            self.messages_upstream.remove(&event_id);
-        };
+            if remove_downstream {
+                self.downstream.remove(&fwd.pair_event_id);
+            }
+        }
 
         debug!("De-egistered event {}", event_id);
     }
