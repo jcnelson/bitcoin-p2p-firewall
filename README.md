@@ -21,8 +21,8 @@ This package only needs the `mio` crate, which works on most major operating sys
 ```
 $ ./bitcoin-p2p-firewalld [-v DEBUG_VERBOSITY] 
                           [-n NETWORK_NAME]
-                          [-b BLACKLISTED_MESSAGES]
-                          [-w WHITELISTED_MESSAGES]
+                          [-a ALLOWED_MESSAGES]
+                          [-d DENIED_MESSAGES]
                           port
                           upstream_bitcoind_address
 ```
@@ -47,7 +47,7 @@ node's p2p address.
 ### Example
 
 ```
-$ ./bitcoin-p2p-firewalld -v 4 -n regtest -b block,cmpctblock 18444 127.0.0.1:18445
+$ ./bitcoin-p2p-firewalld -v 4 -n regtest -d block,cmpctblock 18444 127.0.0.1:18445
 ```
 
 Here, the firewall will bind on port 18444, and will send filtered messages to

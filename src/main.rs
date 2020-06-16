@@ -307,11 +307,11 @@ pub struct BitcoinProxy {
     /// Address of the upstream bitcoind node
     backend_addr: SocketAddr,
     /// List of Bitcoin commands that are prohibited.  All else are allowed.  If this has items,
-    /// then whitelist will be empty.
-    blacklist: Vec<BitcoinCommand>,
+    /// then allow_list will be empty.
+    deny_list: Vec<BitcoinCommand>,
     /// List of Bitcoin commands that are allowed.  All else are pohibited.  If this has items,
-    /// then blacklist will be empty.
-    whitelist: Vec<BitcoinCommand>,
+    /// then deny_list will be empty.
+    allow_list: Vec<BitcoinCommand>,
 
     /// Map event IDs to their downstream sockets and their forwarding states.
     downstream: HashMap<usize, mio_net::TcpStream>,
@@ -714,7 +714,7 @@ impl ForwardState {
     }
 
     /// Read preambles and messages until blocked
-    pub fn read_until_blocked<R: Read>(&mut self, magic: u32, input: &mut R, whitelist: &Vec<BitcoinCommand>, blacklist: &Vec<BitcoinCommand>) -> bool {
+    pub fn read_until_blocked<R: Read>(&mut self, magic: u32, input: &mut R, allow_list: &Vec<BitcoinCommand>, deny_list: &Vec<BitcoinCommand>) -> bool {
         let mut blocked = false;
         while !blocked {
             if self.preamble.is_none() {
@@ -731,7 +731,7 @@ impl ForwardState {
             }
 
             if self.preamble.is_some() {
-                if !self.filtered && BitcoinProxy::filter(&self.preamble.as_ref().unwrap(), whitelist, blacklist) {
+                if !self.filtered && BitcoinProxy::filter(&self.preamble.as_ref().unwrap(), allow_list, deny_list) {
                     self.filtered = true;
                 }
 
@@ -795,8 +795,8 @@ impl BitcoinProxy {
             network: net,
             magic: magic,
             backend_addr: backend_addr,
-            blacklist: vec![],
-            whitelist: vec![],
+            deny_list: vec![],
+            allow_list: vec![],
             messages_downstream: HashMap::new(),
             downstream: HashMap::new(),
             messages_upstream: HashMap::new(),
@@ -804,37 +804,37 @@ impl BitcoinProxy {
         })
     }
 
-    /// Add a command to the firewall whitelist.
+    /// Add a command to the firewall allow_list.
     /// Duplicates are not checked.
-    pub fn add_whitelist(&mut self, cmd: BitcoinCommand) -> () {
-        self.whitelist.push(cmd);
+    pub fn add_allow_list(&mut self, cmd: BitcoinCommand) -> () {
+        self.allow_list.push(cmd);
     }
 
-    /// Adds a command to the firewall blacklist.
+    /// Adds a command to the firewall deny list.
     /// Duplicates are not checked.
-    pub fn add_blacklist(&mut self, cmd: BitcoinCommand) -> () {
-        self.blacklist.push(cmd);
+    pub fn add_deny_list(&mut self, cmd: BitcoinCommand) -> () {
+        self.deny_list.push(cmd);
     }
 
-    /// Given a preamble, a whitelist, and a blacklist, determine whether or not to filter the
+    /// Given a preamble, a allow list, and a deny list, determine whether or not to filter the
     /// Bitcoin message (returns true to filter; false not to).
-    /// While this is not checked, either whitelist, blacklist, or both must have zero entries for
-    /// this to work as expected.  If both lists are non-empty, the whitelist is preferred.
-    pub fn filter(preamble: &BitcoinPreamble, whitelist: &Vec<BitcoinCommand>, blacklist: &Vec<BitcoinCommand>) -> bool {
-        if whitelist.len() > 0 {
-            for cmd in whitelist.iter() {
+    /// While this is not checked, either allow_list, deny_list, or both must have zero entries for
+    /// this to work as expected.  If both lists are non-empty, the allow_list is preferred.
+    pub fn filter(preamble: &BitcoinPreamble, allow_list: &Vec<BitcoinCommand>, deny_list: &Vec<BitcoinCommand>) -> bool {
+        if allow_list.len() > 0 {
+            for cmd in allow_list.iter() {
                 if *cmd == preamble.command {
                     return false;
                 }
             }
-            debug!("Filtered non-whitelisted command '{:?}'", preamble.command.to_string());
+            debug!("Filtered non-allow-listed command '{:?}'", preamble.command.to_string());
             return true;
         }
 
-        if blacklist.len() > 0 {
-            for cmd in blacklist.iter() {
+        if deny_list.len() > 0 {
+            for cmd in deny_list.iter() {
                 if *cmd == preamble.command {
-                    debug!("Filtered blacklisted command '{:?}'", preamble.command.to_string());
+                    debug!("Filtered deny-listed command '{:?}'", preamble.command.to_string());
                     return true;
                 }
             }
@@ -942,8 +942,8 @@ impl BitcoinProxy {
     /// needed.  Handles as many bytes as possible, bufferring them up into the inbound socket's
     /// forwarding state as needed.  Runs until encountering EWOULDBLOCK on both inbound and
     /// outbound.
-    pub fn process_socket_io<R: Read, W: Write>(magic: u32, whitelist: &Vec<BitcoinCommand>, blacklist: &Vec<BitcoinCommand>, inbound: &mut R, forward: &mut ForwardState, outbound: &mut W) -> bool {
-        if !forward.read_until_blocked(magic, inbound, whitelist, blacklist) {
+    pub fn process_socket_io<R: Read, W: Write>(magic: u32, allow_list: &Vec<BitcoinCommand>, deny_list: &Vec<BitcoinCommand>, inbound: &mut R, forward: &mut ForwardState, outbound: &mut W) -> bool {
+        if !forward.read_until_blocked(magic, inbound, allow_list, deny_list) {
             return false;
         }
         if !forward.write_until_blocked(outbound) {
@@ -970,7 +970,7 @@ impl BitcoinProxy {
                 match (self.messages_downstream.get_mut(event_id), self.downstream.get_mut(event_id), self.upstream.get_mut(&pair_event_id)) {
                     (Some(ref mut forward), Some(ref mut downstream), Some(ref mut upstream)) => {
                         debug!("Process I/O from downstream event {} ({:?})", *event_id, downstream);
-                        let alive = BitcoinProxy::process_socket_io(self.magic, &self.whitelist, &self.blacklist, downstream, forward, upstream);
+                        let alive = BitcoinProxy::process_socket_io(self.magic, &self.allow_list, &self.deny_list, downstream, forward, upstream);
                         if !alive {
                             broken.push(*event_id);
                         }
@@ -1100,17 +1100,17 @@ fn main() {
 
     let _ = set_loglevel(verbosity);
 
-    // find -w
-    let whitelist_filter_csv = find_arg_value("-w", &mut argv).unwrap_or("".to_string());
-    let mut whitelist_filter : Vec<String> = whitelist_filter_csv.split(",").filter(|s| s.len() > 0 ).map(|s| s.to_string()).collect();
+    // find -a
+    let allow_list_filter_csv = find_arg_value("-a", &mut argv).unwrap_or("".to_string());
+    let mut allow_list_filter : Vec<String> = allow_list_filter_csv.split(",").filter(|s| s.len() > 0 ).map(|s| s.to_string()).collect();
     
-    // find -b
-    let blacklist_filter_csv = find_arg_value("-b", &mut argv).unwrap_or("".to_string());
-    let mut blacklist_filter : Vec<String> = blacklist_filter_csv.split(",").filter(|s| s.len() > 0).map(|s| s.to_string()).collect();
+    // find -d
+    let deny_list_filter_csv = find_arg_value("-d", &mut argv).unwrap_or("".to_string());
+    let mut deny_list_filter : Vec<String> = deny_list_filter_csv.split(",").filter(|s| s.len() > 0).map(|s| s.to_string()).collect();
 
-    if whitelist_filter.len() != 0 && blacklist_filter.len() != 0 {
-        debug!("Whitelist filter: {:?}", &whitelist_filter);
-        debug!("Blacklist filter: {:?}", &blacklist_filter);
+    if allow_list_filter.len() != 0 && deny_list_filter.len() != 0 {
+        debug!("allow_list filter: {:?}", &allow_list_filter);
+        debug!("deny_list filter: {:?}", &deny_list_filter);
         usage(prog_name.clone());
     }
 
@@ -1156,24 +1156,24 @@ fn main() {
     debug!("Bound to 0.0.0.0:{}", port);
     debug!("Backend is {}", &backend);
 
-    for message_name in whitelist_filter.drain(..) {
+    for message_name in allow_list_filter.drain(..) {
         if message_name.len() > 12 {
             eprintln!("Invalid Bitcoin message type: '{}'", message_name);
             usage(prog_name.clone());
         }
-        info!("Whitelist '{}'", message_name);
+        info!("allow_list '{}'", message_name);
         let bitcoin_cmd = BitcoinCommand::from_str(&message_name).unwrap();
-        proxy.add_whitelist(bitcoin_cmd);
+        proxy.add_allow_list(bitcoin_cmd);
     }
     
-    for message_name in blacklist_filter.drain(..) {
+    for message_name in deny_list_filter.drain(..) {
         if message_name.len() > 12 {
             eprintln!("Invalid Bitcoin message type: '{}'", message_name);
             usage(prog_name.clone());
         }
-        info!("Blacklist '{}'", message_name);
+        info!("deny_list '{}'", message_name);
         let bitcoin_cmd = BitcoinCommand::from_str(&message_name).unwrap();
-        proxy.add_blacklist(bitcoin_cmd);
+        proxy.add_deny_list(bitcoin_cmd);
     }
 
     loop {
@@ -1385,7 +1385,7 @@ mod test {
     }
     
     #[test]
-    fn test_socket_io_whitelist() {
+    fn test_socket_io_allow_list() {
         let stream_bytes = vec![
             // magic
             0xd9, 0xb4, 0xbe, 0xf9,
@@ -1464,7 +1464,7 @@ mod test {
     }
     
     #[test]
-    fn test_socket_io_blacklist() {
+    fn test_socket_io_deny_list() {
         let stream_bytes = vec![
             // magic
             0xd9, 0xb4, 0xbe, 0xf9,
