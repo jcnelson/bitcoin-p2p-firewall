@@ -1,19 +1,15 @@
+FROM rust:bookworm as build
+WORKDIR /src
+COPY . .
+
+
 FROM rust as builder
 WORKDIR /src
 COPY . .
-RUN rustup target add x86_64-unknown-linux-musl
-
-RUN apt-get update && apt-get install -y git musl-tools
-
-RUN CC=musl-gcc \
-    CC_x86_64_unknown_linux_musl=musl-gcc \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-    cargo build --release --workspace --target x86_64-unknown-linux-musl
-RUN mkdir /out && cp -R /src/target/x86_64-unknown-linux-musl/release/. /out
+RUN cargo build --release 
+RUN mkdir /out && cp -R /src/target/release/bitcoin-p2p-firewalld /out
 
 
-FROM alpine
-WORKDIR /
-RUN apk --no-cache add --update
+FROM debian:bookworm
 COPY --from=builder /out/bitcoin-p2p-firewalld /usr/local/bin/bitcoin-p2p-firewalld
-CMD [ "/usr/local/bin/bitcoin-p2p-firewalld -n regtest -b block,cmpctblock 18444 bitcoin_regtest.bitcoind:28443" ]
+CMD [ "/usr/local/bin/bitcoin-p2p-firewalld", "-v", "3", "-n", "regtest", "-d", "block,cmpctblock", "18444", "127.0.0.1:28444" ]
